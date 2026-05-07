@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-CS432/532 Secure Channel — Server (TCP).
-
-Submission naming (SUCourse): rename this file to:
-XXXX_Surname_OtherNames_server.py  (XXXX = your SUNet username)
-
-Dependency: pip install cryptography
-Standard library: tkinter, socket, threading, sqlite3, secrets, struct, hashlib, hmac, queue
-"""
 from __future__ import annotations
 
 import hashlib
@@ -29,13 +20,13 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.backends import default_backend
 
-# --- Constants (PDF-aligned) ---
+# --- Constants ---
 CHANNELS = ("IF100", "MATH101", "SPS101")
 SHA3_512_DIGEST = 64
 RSA_KEY_SIZE_BYTES = 384  # 3072 bits
 MAX_FRAME = 16 * 1024 * 1024
 
-# Protocol strings (match PDF examples)
+# Protocol strings
 MSG_ENROLL_OK = "SUCCESS"
 MSG_ENROLL_ERR_USER = "ERROR:USERNAME_TAKEN"
 MSG_AUTH_OK = "Authentication Successful"
@@ -43,13 +34,16 @@ MSG_AUTH_FAIL = "Authentication Unsuccessful"
 MSG_CHANNEL_UNAVAILABLE = "Channel Unavailable"
 
 
+# Normalize channel strings for DB/UI consistency (strip whitespace).
 def normalize_channel(name: str) -> str:
-    """Normalize DB/GUI channel strings so notebook tabs always match (strip whitespace)."""
+    # Normalize DB/GUI channel strings so UI panels always match (strip whitespace).
     return name.strip()
 
 
+# Parse a relayed broadcast packet (op "B") into (ciphertext, mac) for logging.
 def parse_relay_wire_payload(packet: bytes) -> Optional[Tuple[bytes, bytes]]:
-    """Parse client broadcast wire bytes: b'B' + u32_be(len_ct) + ciphertext + HMAC-SHA3-512."""
+    # Parse client broadcast wire bytes:
+    #   b'B' + u32_be(len_ct) + ciphertext + HMAC-SHA3-512(64B)
     if len(packet) < 1 + 4 + SHA3_512_DIGEST:
         return None
     if packet[:1] != b"B":
@@ -66,16 +60,21 @@ def parse_relay_wire_payload(packet: bytes) -> Optional[Tuple[bytes, bytes]]:
     return ct, mac
 
 
+ # Compute SHA3-512 digest for protocol-derived keys and hashes.
 def sha3_512(data: bytes) -> bytes:
     return hashlib.sha3_512(data).digest()
 
 
+ # Compute HMAC-SHA3-512 used for auth proof and message integrity.
 def hmac_sha3_512(key: bytes, msg: bytes) -> bytes:
     return hmac.new(key, msg, hashlib.sha3_512).digest()
 
 
+ # Derive AES key/IV from reversed-password hash for encrypting/decrypting auth ACKs.
 def derive_password_side_keys_from_rev_hash(rev_hash: bytes) -> Tuple[bytes, bytes]:
-    """AES-256 key = first 32 bytes; IV = next 16 bytes (lower half of upper half of SHA3-512)."""
+    # Password-side (client/server) decrypt keys derived from SHA3-512(reversed_password):
+    # - AES-256 key = first 32 bytes
+    # - IV = next 16 bytes
     if len(rev_hash) != SHA3_512_DIGEST:
         raise ValueError("invalid rev_hash length")
     aes_key = rev_hash[:32]
@@ -83,8 +82,11 @@ def derive_password_side_keys_from_rev_hash(rev_hash: bytes) -> Tuple[bytes, byt
     return aes_key, iv
 
 
+ # Derive per-channel AES/IV/HMAC keys from the server's master secret (KDF as per PDF).
 def derive_channel_keys_from_master(master: str) -> Tuple[bytes, bytes, bytes]:
-    """Channel AES (32), IV (16), HMAC key (32). PDF: split SHA3-512(master); HMAC key from SHA3-512(reverse(master))[:32]."""
+    # Per-channel symmetric keys derived from the server's master secret (PDF-aligned):
+    # - AES-256 key + IV from SHA3-512(master)
+    # - HMAC key from SHA3-512(reverse(master))[:32]
     m = master.encode("utf-8")
     h = sha3_512(m)
     aes_k = h[:32]
@@ -94,6 +96,7 @@ def derive_channel_keys_from_master(master: str) -> Tuple[bytes, bytes, bytes]:
     return aes_k, iv, hmac_k
 
 
+ # Encrypt using AES-256-CBC with PKCS7 padding.
 def aes_cbc_pkcs7_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     padder = sym_padding.PKCS7(128).padder()
     data = padder.update(plaintext) + padder.finalize()
@@ -102,6 +105,7 @@ def aes_cbc_pkcs7_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     return enc.update(data) + enc.finalize()
 
 
+ # Decrypt AES-256-CBC with PKCS7 unpadding.
 def aes_cbc_pkcs7_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     dec = cipher.decryptor()
@@ -110,6 +114,7 @@ def aes_cbc_pkcs7_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
     return unpadder.update(padded) + unpadder.finalize()
 
 
+ # Read exactly N bytes from a TCP stream (or raise on disconnect).
 def recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
@@ -120,6 +125,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+ # Receive a length-prefixed frame (4B big-endian length + payload).
 def recv_frame(sock: socket.socket) -> bytes:
     hdr = recv_exact(sock, 4)
     ln = struct.unpack("!I", hdr)[0]
@@ -128,27 +134,33 @@ def recv_frame(sock: socket.socket) -> bytes:
     return recv_exact(sock, ln)
 
 
+ # Send a length-prefixed frame (4B big-endian length + payload).
 def send_frame(sock: socket.socket, payload: bytes) -> None:
     sock.sendall(struct.pack("!I", len(payload)) + payload)
 
 
+ # RSA sign using SHA3-512 (used for enrollment responses and auth ACK ciphertext).
 def rsa_sign_sha3_512(priv: rsa.RSAPrivateKey, data: bytes) -> bytes:
     return priv.sign(data, padding.PKCS1v15(), hashes.SHA3_512())
 
 
+ # Verify RSA signature using SHA3-512.
 def rsa_verify_sha3_512(pub: rsa.RSAPublicKey, data: bytes, sig: bytes) -> None:
     pub.verify(sig, data, padding.PKCS1v15(), hashes.SHA3_512())
 
 
+ # RSA encrypt enrollment plaintext (PKCS#1 v1.5 for compatibility with SHA3-only requirement).
 def rsa_encrypt_pkcs1v15(pub: rsa.RSAPublicKey, plaintext: bytes) -> bytes:
     # cryptography does not support OAEP+SHA3-512; project only requires RSA encryption here.
     return pub.encrypt(plaintext, padding.PKCS1v15())
 
 
+ # RSA decrypt enrollment ciphertext.
 def rsa_decrypt_pkcs1v15(priv: rsa.RSAPrivateKey, ciphertext: bytes) -> bytes:
     return priv.decrypt(ciphertext, padding.PKCS1v15())
 
 
+ # Build enrollment plaintext blob that will be RSA-encrypted.
 def pack_enrollment_plaintext(username: str, channel: str, pwd_hash: bytes, rev_hash: bytes) -> bytes:
     u = username.encode("utf-8")
     c = channel.encode("utf-8")
@@ -159,6 +171,7 @@ def pack_enrollment_plaintext(username: str, channel: str, pwd_hash: bytes, rev_
     return struct.pack("!H", len(u)) + u + struct.pack("!H", len(c)) + c + pwd_hash + rev_hash
 
 
+# Parse the decrypted enrollment plaintext into fields.
 def unpack_enrollment_plaintext(blob: bytes) -> Tuple[str, str, bytes, bytes]:
     off = 0
     lu = struct.unpack_from("!H", blob, off)[0]
@@ -179,10 +192,13 @@ def unpack_enrollment_plaintext(blob: bytes) -> Tuple[str, str, bytes, bytes]:
 
 
 class EnrollmentDB:
+    # SQLite-backed enrollment database (username -> hashes + channel).
+    # Initialize DB wrapper and ensure schema exists.
     def __init__(self, path: str) -> None:
         self.path = path
         self._init()
 
+    # Create tables if missing.
     def _init(self) -> None:
         con = sqlite3.connect(self.path)
         try:
@@ -200,6 +216,7 @@ class EnrollmentDB:
         finally:
             con.close()
 
+    # Check whether a username is enrolled.
     def exists(self, username: str) -> bool:
         con = sqlite3.connect(self.path)
         try:
@@ -208,6 +225,7 @@ class EnrollmentDB:
         finally:
             con.close()
 
+    # Insert a new enrolled user record.
     def insert(self, username: str, pwd_hash: bytes, rev_hash: bytes, channel: str) -> None:
         con = sqlite3.connect(self.path)
         try:
@@ -219,6 +237,7 @@ class EnrollmentDB:
         finally:
             con.close()
 
+    # Fetch enrolled user's hashes and channel (or None).
     def get_user(self, username: str) -> Optional[Tuple[bytes, bytes, str]]:
         con = sqlite3.connect(self.path)
         try:
@@ -233,8 +252,9 @@ class EnrollmentDB:
 
 
 class ClientSession:
-    """Connected socket + per-connection state (server worker thread)."""
+    # Connected socket + per-connection state (server worker thread).
 
+    # Initialize per-connection session state.
     def __init__(self, sock: socket.socket, addr: Any, server: "SecureServerApp") -> None:
         self.sock = sock
         self.addr = addr
@@ -244,13 +264,16 @@ class ClientSession:
         self.authenticated = False
         self.send_lock = threading.Lock()
 
+    # Log a line tagged with this connection's address.
     def log(self, text: str) -> None:
         self.server.log_line(f"[{self.addr}] {text}")
 
+    # Thread-safe raw send of an already-framed payload.
     def send_raw(self, data: bytes) -> None:
         with self.send_lock:
             send_frame(self.sock, data)
 
+    # Close the underlying socket (best-effort).
     def close(self) -> None:
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -263,6 +286,8 @@ class ClientSession:
 
 
 class SecureServerApp:
+    # Tkinter server app: maintains enrollment DB, auth sessions, and relays encrypted broadcasts.
+    # Build the full server GUI and initialize state.
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("CS432/532 Secure Channel Server")
@@ -314,29 +339,27 @@ class SecureServerApp:
             ttk.Button(fr, text="Generate Key", command=lambda c=ch: self.generate_channel_keys(c)).pack(pady=2)
             col += 1
 
-        f_online = ttk.LabelFrame(root, text="Online clients")
-        f_online.grid(row=4, column=0, columnspan=4, sticky="nsew", padx=6, pady=4)
-        self.online_list = scrolledtext.ScrolledText(f_online, height=6, width=100, state="disabled")
+        # Compact layout for small screens: use tabs instead of stacking many panels vertically.
+        nb = ttk.Notebook(root)
+        nb.grid(row=4, column=0, columnspan=4, sticky="nsew", padx=6, pady=4)
+
+        tab_online = ttk.Frame(nb)
+        nb.add(tab_online, text="Online clients")
+        self.online_list = scrolledtext.ScrolledText(tab_online, height=10, width=100, state="disabled", wrap="none")
         self.online_list.pack(fill="both", expand=True)
 
-        f_chlogs = ttk.LabelFrame(
-            root,
-            text="Per-channel relay logs (encrypted summaries — server does not decrypt or verify)",
-        )
-        f_chlogs.grid(row=5, column=0, columnspan=4, sticky="ew", padx=6, pady=4)
-        self.channel_logs: Dict[str, scrolledtext.ScrolledText] = {}
-        for i, ch in enumerate(CHANNELS):
-            sub = ttk.LabelFrame(f_chlogs, text=f"{ch} channel log")
-            sub.grid(row=i, column=0, sticky="ew", padx=4, pady=3)
-            sub.columnconfigure(0, weight=1)
-            tx = scrolledtext.ScrolledText(sub, height=5, width=100, state="disabled", wrap="word")
-            tx.grid(row=0, column=0, sticky="ew")
+        self.channel_logs = {}
+        for ch in CHANNELS:
+            tab = ttk.Frame(nb)
+            nb.add(tab, text=f"{ch} log")
+            tx = scrolledtext.ScrolledText(tab, height=10, width=100, state="disabled", wrap="word")
+            tx.pack(fill="both", expand=True)
             tx.configure(state="normal")
             tx.insert("end", "No messages yet.\n")
             tx.configure(state="disabled")
             self.channel_logs[ch] = tx
-        f_chlogs.columnconfigure(0, weight=1)
 
+        # Make notebook expand with window resize.
         root.rowconfigure(4, weight=1)
         root.columnconfigure(0, weight=1)
 
@@ -356,11 +379,13 @@ class SecureServerApp:
 
         self.root.after(120, self._drain_log_queue)
 
+    # Pick server encryption private key PEM path.
     def browse_enc_prv(self) -> None:
         p = filedialog.askopenfilename(title="server_enc_dec_pub_prv.pem", filetypes=[("PEM", "*.pem"), ("All", "*.*")])
         if p:
             self.path_enc_prv.set(p)
 
+    # Pick server signing private key PEM path.
     def browse_sign_prv(self) -> None:
         p = filedialog.askopenfilename(
             title="Signing private key (PEM)", filetypes=[("PEM", "*.pem"), ("All", "*.*")]
@@ -368,6 +393,7 @@ class SecureServerApp:
         if p:
             self.path_sign_prv.set(p)
 
+    # Load server RSA private keys from selected PEM files.
     def _load_rsa_keys(self) -> bool:
         pe = self.path_enc_prv.get().strip()
         ps = self.path_sign_prv.get().strip()
@@ -395,9 +421,11 @@ class SecureServerApp:
             self.log_line(f"{label} private d (hex, prefix): {hex(prv.d)[:130]}...")
         return True
 
+    # Enqueue a line to append to the GUI log.
     def log_line(self, s: str) -> None:
         self.log_q.put(s)
 
+    # Drain queued log lines into the GUI text widget.
     def _drain_log_queue(self) -> None:
         try:
             while True:
@@ -410,14 +438,16 @@ class SecureServerApp:
             pass
         self.root.after(120, self._drain_log_queue)
 
+    # Refresh the "Online clients" tab from current server state.
     def _set_online_widget(self) -> None:
         self.online_list.configure(state="normal")
         self.online_list.delete("1.0", "end")
         with self.sessions_lock:
             for u, se in self.online_users.items():
-                self.online_list.insert("end", f"{u} -> {se.channel} @ {se.addr}\n")
+                self.online_list.insert("end", f"{u} -> {se.channel} {se.addr}\n")
         self.online_list.configure(state="disabled")
 
+    # Generate per-channel AES/IV/HMAC keys from a master secret (one-time per run).
     def generate_channel_keys(self, channel: str) -> None:
         if self.gen_flags[channel]:
             messagebox.showinfo("Info", f"{channel} keys were already generated (must not change while server runs).")
@@ -435,6 +465,7 @@ class SecureServerApp:
         self.log_line(f"{channel} HMAC key (hex): {hmac_k.hex()}")
         self.log_line(f"Master SHA3-512 (hex, prefix): {sha3_512(ms.encode()).hex()[:64]}...")
 
+    # Start TCP listener and accept loop.
     def start_listen(self) -> None:
         if not self._load_rsa_keys():
             return
@@ -459,6 +490,7 @@ class SecureServerApp:
         self.accept_thread.start()
         self.log_line(f"Listening on: 0.0.0.0:{port} (TCP)")
 
+    # Stop listener and close all active client sockets.
     def stop_listen(self) -> None:
         self.running = False
         if self.sock_listen:
@@ -479,6 +511,7 @@ class SecureServerApp:
         self.btn_stop.configure(state="disabled")
         self.log_line("Server stopped listening; all client sockets were closed.")
 
+    # Accept incoming TCP connections in a background thread.
     def _accept_loop(self) -> None:
         assert self.sock_listen is not None
         while self.running:
@@ -489,11 +522,13 @@ class SecureServerApp:
             t = threading.Thread(target=self._client_worker, args=(conn, addr), daemon=True)
             t.start()
 
+    # Track a new session and update online widget.
     def register_session(self, sid: int, session: ClientSession) -> None:
         with self.sessions_lock:
             self.sessions[sid] = session
         self.root.after(0, self._set_online_widget)
 
+    # Remove a session from tracking and update online widget.
     def unregister_session(self, sid: int) -> None:
         with self.sessions_lock:
             self.sessions.pop(sid, None)
@@ -502,19 +537,24 @@ class SecureServerApp:
                 del self.online_users[u]
         self.root.after(0, self._set_online_widget)
 
+    # Mark a user as online after successful authentication.
     def add_online(self, username: str, session: ClientSession) -> None:
         with self.sessions_lock:
             self.online_users[username] = session
         self.root.after(0, self._set_online_widget)
 
+    # Remove an online user (disconnect/cleanup).
     def remove_online_user(self, username: str) -> None:
         with self.sessions_lock:
             self.online_users.pop(username, None)
         self.root.after(0, self._set_online_widget)
 
+    # Append an encrypted relay summary to the per-channel log tab.
     def append_channel_traffic_log(self, channel: str, text: str) -> None:
         key = normalize_channel(channel)
 
+        # UI update closure (run on Tk thread).
+        # Append to the channel tab and keep the view scrolled to the end.
         def _w() -> None:
             w = self.channel_logs.get(key)
             if w is None:
@@ -530,6 +570,7 @@ class SecureServerApp:
 
         self.root.after(0, _w)
 
+    # Relay an encrypted broadcast to all authenticated clients in the same channel.
     def relay_broadcast(self, from_session: ClientSession, packet: bytes) -> None:
         ch = normalize_channel(from_session.channel or "")
         if not ch:
@@ -567,6 +608,7 @@ class SecureServerApp:
 
     # --- Protocol handling ---
 
+    # Per-client worker: receive frames and dispatch protocol handlers.
     def _client_worker(self, conn: socket.socket, addr: Any) -> None:
         session = ClientSession(conn, addr, self)
         sid = id(session)
@@ -600,6 +642,7 @@ class SecureServerApp:
             session.close()
             session.log("Socket closed")
 
+    # Handle enrollment request (RSA-decrypt, store in SQLite, return signed response).
     def _handle_enroll(self, session: ClientSession, rsa_cipher: bytes) -> None:
         assert self.priv_enc is not None and self.priv_sign is not None
         try:
@@ -639,8 +682,9 @@ class SecureServerApp:
         self.log_line(f"  pwd_hash (hex): {pwd_h.hex()}")
         self.log_line(f"  rev_pwd_hash (hex): {rev_h.hex()}")
 
+    # Handle authentication handshake steps (A1 username -> challenge, A2 HMAC -> signed ACK).
     def _handle_auth(self, session: ClientSession, body: bytes) -> None:
-        """body: sub-op byte + payload (multiple auth steps share the same op code)."""
+        # `body` = sub-op byte + payload (multiple auth steps share the same op code).
         assert self.priv_enc is not None and self.priv_sign is not None
         if len(body) < 1:
             return
@@ -721,9 +765,10 @@ class SecureServerApp:
             ck = self.channel_keys[ch]
             chb = ch.encode("utf-8")
             inner_plain = ck["aes"] + ck["iv"] + ck["hmac"] + struct.pack("!H", len(chb)) + chb
-            aes_k, iv = derive_password_side_keys_from_rev_hash(session._rev_hash)  # type: ignore
-            inner_cipher = aes_cbc_pkcs7_encrypt(aes_k, iv, inner_plain)
-            outer_plain = MSG_AUTH_OK.encode("utf-8") + b"\n" + struct.pack("!I", len(inner_cipher)) + inner_cipher
+            # Success ACK plaintext = "Authentication Successful\n" + channel key material blob.
+            # This whole plaintext is encrypted once (AES-CBC) and the ciphertext is RSA-signed in
+            # `_send_auth_ack_encrypted_signed`.
+            outer_plain = MSG_AUTH_OK.encode("utf-8") + b"\n" + inner_plain
             self._send_auth_ack_encrypted_signed(session, session._rev_hash, outer_plain)
             session.authenticated = True
             session.channel = ch
@@ -733,6 +778,7 @@ class SecureServerApp:
             self.log_line(f"Authenticated: {uname} ({ch})")
             return
 
+    # Encrypt auth ACK with AES-CBC and sign ciphertext with RSA (sent as op "K").
     def _send_auth_ack_encrypted_signed(self, session: ClientSession, rev_hash: bytes, outer_plain: bytes) -> None:
         assert self.priv_sign is not None
         aes_k, iv = derive_password_side_keys_from_rev_hash(rev_hash)
@@ -740,16 +786,19 @@ class SecureServerApp:
         sig = rsa_sign_sha3_512(self.priv_sign, outer_cipher)
         session.send_raw(b"K" + outer_cipher + sig)
 
+    # Handle a secure message send (relay as broadcast to same channel).
     def _handle_message(self, session: ClientSession, packet: bytes) -> None:
         if not session.authenticated or not session.channel:
             return
         self.relay_broadcast(session, b"B" + packet)
 
 
+# Server GUI entrypoint.
 def main() -> None:
     root = tk.Tk()
     app = SecureServerApp(root)
 
+    # Window close handler.
     def on_close() -> None:
         app.stop_listen()
         root.destroy()

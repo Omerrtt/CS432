@@ -24,12 +24,23 @@ CHANNELS = ("IF100", "MATH101", "SPS101")
 SHA3_512_DIGEST = 64
 MAX_FRAME = 16 * 1024 * 1024
 
+# Wire protocol overview (all frames are length-prefixed by `send_frame/recv_frame`):
+# - Enrollment request:      b"E" + RSA_ENC(enrollment_plaintext)
+# - Enrollment response:     b"R" + u16_be(len_text) + text + RSA_SIGN(text)
+# - Auth hello:              b"A" + b"1" + UTF8(username)
+# - Auth proof (HMAC):       b"A" + b"2" + HMAC_SHA3_512(SHA3_512(password)[:32], challenge16)
+# - Auth challenge:          b"C" + 16B challenge
+# - Auth result (signed):    b"K" + outer_ciphertext + RSA_SIGN(outer_ciphertext)
+# - Secure message send:     b"M" + u32_be(len_ct) + ct + HMAC_SHA3_512(channel_hmac_key, ct)
+# - Secure broadcast recv:   b"B" + u32_be(len_ct) + ct + 64B HMAC
+
 MSG_ENROLL_OK = "SUCCESS"
 MSG_AUTH_OK = "Authentication Successful"
 MSG_AUTH_FAIL = "Authentication Unsuccessful"
 MSG_CHANNEL_UNAVAILABLE = "Channel Unavailable"
 
 
+# Format socket exceptions as stable English messages for demos/logs.
 def english_socket_connect_error(exc: OSError) -> str:
     winerr = getattr(exc, "winerror", None)
     if winerr == 10061 or exc.errno in (errno.ECONNREFUSED,):
@@ -44,20 +55,27 @@ def english_socket_connect_error(exc: OSError) -> str:
     return f"Socket error (errno={exc.errno}, winerror={winerr}): {exc.__class__.__name__}"
 
 
+ # Compute SHA3-512 digest for protocol-derived keys and hashes.
 def sha3_512(data: bytes) -> bytes:
     return hashlib.sha3_512(data).digest()
 
 
+ # Compute HMAC-SHA3-512 used for auth proof and message integrity.
 def hmac_sha3_512(key: bytes, msg: bytes) -> bytes:
     return hmac.new(key, msg, hashlib.sha3_512).digest()
 
 
+ # Derive AES key/IV from reversed-password hash for decrypting server ACKs.
 def derive_password_side_keys_from_rev_hash(rev_hash: bytes) -> Tuple[bytes, bytes]:
+    # Decrypt keys for auth ACK are derived from SHA3-512(reversed_password):
+    # - AES-256 key = first 32 bytes
+    # - IV = next 16 bytes
     aes_key = rev_hash[:32]
     iv = rev_hash[32:48]
     return aes_key, iv
 
 
+ # Encrypt using AES-256-CBC with PKCS7 padding.
 def aes_cbc_pkcs7_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     padder = sym_padding.PKCS7(128).padder()
     data = padder.update(plaintext) + padder.finalize()
@@ -66,6 +84,7 @@ def aes_cbc_pkcs7_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     return enc.update(data) + enc.finalize()
 
 
+ # Decrypt AES-256-CBC with PKCS7 unpadding.
 def aes_cbc_pkcs7_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     dec = cipher.decryptor()
@@ -74,6 +93,7 @@ def aes_cbc_pkcs7_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
     return unpadder.update(padded) + unpadder.finalize()
 
 
+ # Read exactly N bytes from a TCP stream (or raise on disconnect).
 def recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
@@ -84,7 +104,9 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+ # Receive a length-prefixed frame (4B big-endian length + payload).
 def recv_frame(sock: socket.socket) -> bytes:
+    # Frame layer: 4-byte big-endian length prefix + payload bytes.
     hdr = recv_exact(sock, 4)
     ln = struct.unpack("!I", hdr)[0]
     if ln > MAX_FRAME:
@@ -92,20 +114,27 @@ def recv_frame(sock: socket.socket) -> bytes:
     return recv_exact(sock, ln)
 
 
+ # Send a length-prefixed frame (4B big-endian length + payload).
 def send_frame(sock: socket.socket, payload: bytes) -> None:
+    # Frame layer: 4-byte big-endian length prefix + payload bytes.
     sock.sendall(struct.pack("!I", len(payload)) + payload)
 
 
+ # RSA encrypt enrollment plaintext
 def rsa_encrypt_pkcs1v15(pub: rsa.RSAPublicKey, plaintext: bytes) -> bytes:
     # cryptography does not support OAEP+SHA3-512; project only requires RSA encryption here.
     return pub.encrypt(plaintext, padding.PKCS1v15())
 
 
+ # Verify RSA signature over ciphertext/text using SHA3-512.
 def rsa_verify_sha3_512(pub: rsa.RSAPublicKey, data: bytes, sig: bytes) -> None:
     pub.verify(sig, data, padding.PKCS1v15(), hashes.SHA3_512())
 
 
+ # Build enrollment plaintext blob that will be RSA-encrypted.
 def pack_enrollment_plaintext(username: str, channel: str, pwd_hash: bytes, rev_hash: bytes) -> bytes:
+    # Enrollment plaintext (before RSA encryption):
+    #   u16_be(len(username)) + username + u16_be(len(channel)) + channel + 64B pwd_hash + 64B rev_hash
     u = username.encode("utf-8")
     c = channel.encode("utf-8")
     if len(pwd_hash) != 64 or len(rev_hash) != 64:
@@ -115,16 +144,20 @@ def pack_enrollment_plaintext(username: str, channel: str, pwd_hash: bytes, rev_
     return struct.pack("!H", len(u)) + u + struct.pack("!H", len(c)) + c + pwd_hash + rev_hash
 
 
+# Helper: compute RSA modulus bit-length (for signature size).
 def rsa_sig_len_bits(pub: rsa.RSAPublicKey) -> int:
     return pub.public_numbers().n.bit_length()
 
 
+# Helper: compute RSA signature length in bytes.
 def rsa_sig_bytes(pub: rsa.RSAPublicKey) -> int:
     bits = rsa_sig_len_bits(pub)
     return (bits + 7) // 8
 
 
 class SecureClientApp:
+    # Tkinter client app: handles enrollment, login/auth, and secure broadcasts.
+    # Build the full client GUI and initialize state.
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("CS432/532 Secure Channel Client")
@@ -214,37 +247,47 @@ class SecureClientApp:
 
         self.root.after(100, self._drain_log_queue)
 
+    # Show an info popup safely from worker threads.
     def _ui_info(self, title: str, msg: str) -> None:
+        # Tk callback that runs on the UI thread.
         def _show() -> None:
             messagebox.showinfo(title, msg, parent=self.root)
 
         self.root.after(0, _show)
 
+    # Show a warning popup safely from worker threads.
     def _ui_warn(self, title: str, msg: str) -> None:
+        # Tk callback that runs on the UI thread.
         def _show() -> None:
             messagebox.showwarning(title, msg, parent=self.root)
 
         self.root.after(0, _show)
 
+    # Show an error popup safely from worker threads.
     def _ui_error(self, title: str, msg: str) -> None:
+        # Tk callback that runs on the UI thread.
         def _show() -> None:
             messagebox.showerror(title, msg, parent=self.root)
 
         self.root.after(0, _show)
 
+    # Pick server encryption public key PEM path.
     def browse_enc_pub(self) -> None:
         p = filedialog.askopenfilename(title="server_enc_dec_pub.pem", filetypes=[("PEM", "*.pem"), ("All", "*.*")])
         if p:
             self.path_enc_pub.set(p)
 
+    # Pick server signature verification public key PEM path.
     def browse_sign_pub(self) -> None:
         p = filedialog.askopenfilename(title="server_sign_verify_pub.pem", filetypes=[("PEM", "*.pem"), ("All", "*.*")])
         if p:
             self.path_sign_pub.set(p)
 
+    # Enqueue a line to append to the GUI log.
     def log_line(self, s: str) -> None:
         self.log_q.put(s)
 
+    # Drain queued log lines into the GUI text widget.
     def _drain_log_queue(self) -> None:
         try:
             while True:
@@ -257,6 +300,7 @@ class SecureClientApp:
             pass
         self.root.after(100, self._drain_log_queue)
 
+    # Load server RSA public keys from selected PEM files.
     def _load_pub_keys(self) -> bool:
         pe = self.path_enc_pub.get().strip()
         ps = self.path_sign_pub.get().strip()
@@ -280,6 +324,7 @@ class SecureClientApp:
         self.log_line("Sign modulus (hex, prefix): " + hex(ns)[:66] + "...")
         return True
 
+    # Connect to server using IP/port fields (with popup on failure).
     def _tcp_connect(self) -> Optional[socket.socket]:
         if not self._load_pub_keys():
             return None
@@ -306,6 +351,7 @@ class SecureClientApp:
             return None
         return s
 
+    # Close socket and reset client auth state.
     def disconnect(self) -> None:
         self.authenticated = False
         self.channel_aes = self.channel_iv = self.channel_hmac = None
@@ -326,16 +372,20 @@ class SecureClientApp:
         self._set_send_enabled(False)
         self.log_line("Disconnected.")
 
+    # Enable/disable the Send button based on auth state.
     def _set_send_enabled(self, on: bool) -> None:
         self.btn_send.configure(state=("normal" if on else "disabled"))
 
+    # Start enrollment in a background thread.
     def do_enroll(self) -> None:
         threading.Thread(target=self._enroll_worker, daemon=True).start()
 
+    # Worker wrapper: serialize IO operations via a lock.
     def _enroll_worker(self) -> None:
         with self.io_lock:
             self._enroll_worker_locked()
 
+    # Perform enrollment protocol over a fresh TCP connection.
     def _enroll_worker_locked(self) -> None:
         sock = self._tcp_connect()
         if not sock:
@@ -385,13 +435,16 @@ class SecureClientApp:
             except OSError:
                 pass
 
+    # Start login/authentication in a background thread.
     def do_login(self) -> None:
         threading.Thread(target=self._login_worker, daemon=True).start()
 
+    # Worker wrapper: serialize IO operations via a lock.
     def _login_worker(self) -> None:
         with self.io_lock:
             self._login_worker_locked()
 
+    # Perform authentication handshake and start receive loop on success.
     def _login_worker_locked(self) -> None:
         if self.sock:
             self._ui_info("Info", "Please disconnect first.")
@@ -407,23 +460,33 @@ class SecureClientApp:
                 self._ui_error("Login", "Please enter username and password.")
                 self.disconnect()
                 return
+            # A1: send cleartext username, receive challenge (C + 16B).
             send_frame(sock, b"A" + b"1" + username.encode("utf-8"))
             self.log_line(f"Auth request (cleartext username): {username}")
             chfr = recv_frame(sock)
             if chfr[:1] != b"C" or len(chfr) != 1 + 16:
-                self.log_line("Challenge format error")
-                self._ui_error("Login", "Invalid challenge from server.")
-                self.disconnect()
-                return
-            challenge = chfr[1:]
-            self.log_line(f"Challenge (hex): {challenge.hex()}")
-            pwd_digest = sha3_512(pw.encode("utf-8"))
-            hkey = pwd_digest[:32]
-            mac = hmac_sha3_512(hkey, challenge)
-            self.log_line(f"HMAC key (lower 32 bytes of SHA3-512(password), hex): {hkey.hex()}")
-            self.log_line(f"HMAC-SHA3-512(challenge) (hex): {mac.hex()}")
-            send_frame(sock, b"A" + b"2" + mac)
-            pack = recv_frame(sock)
+                # Some server-side failures can short-circuit directly to a signed auth result (K),
+                # e.g., "username already online" / "another login in progress".
+                if chfr[:1] == b"K":
+                    self.log_line("Server returned auth result without challenge (early K).")
+                    pack = chfr
+                else:
+                    self.log_line("Challenge format error")
+                    self._ui_error("Login", "Invalid challenge from server.")
+                    self.disconnect()
+                    return
+            else:
+                challenge = chfr[1:]
+                self.log_line(f"Challenge (hex): {challenge.hex()}")
+                # A2: prove password knowledge via HMAC over challenge.
+                pwd_digest = sha3_512(pw.encode("utf-8"))
+                hkey = pwd_digest[:32]
+                mac = hmac_sha3_512(hkey, challenge)
+                self.log_line(f"HMAC key (lower 32 bytes of SHA3-512(password), hex): {hkey.hex()}")
+                self.log_line(f"HMAC-SHA3-512(challenge) (hex): {mac.hex()}")
+                send_frame(sock, b"A" + b"2" + mac)
+                # K: signed ciphertext blob, decryptable only with keys derived from reversed password.
+                pack = recv_frame(sock)
             if pack[:1] != b"K":
                 self.log_line("Auth result format error")
                 self._ui_error("Login", "Invalid auth response from server.")
@@ -477,14 +540,10 @@ class SecureClientApp:
                 self._ui_error("Login", "Malformed successful auth plaintext.")
                 self.disconnect()
                 return
-            inner_blob = outer_plain[len(okb) + 1 :]
-            if len(inner_blob) < 4:
-                self._ui_error("Login", "Malformed inner key blob.")
-                self.disconnect()
-                return
-            ilen = struct.unpack_from("!I", inner_blob, 0)[0]
-            inner_cipher = inner_blob[4 : 4 + ilen]
-            inner_plain = aes_cbc_pkcs7_decrypt(aes_k, iv, inner_cipher)
+            # Success ACK plaintext format (single encryption layer):
+            #   b"Authentication Successful\n" + inner_plain
+            # inner_plain = channel_aes(32) || channel_iv(16) || channel_hmac(32) || u16_be(len(ch)) || ch_utf8
+            inner_plain = outer_plain[len(okb) + 1 :]
             if len(inner_plain) < 80 + 2:
                 self._ui_error("Login", "Failed to parse channel key material.")
                 self.disconnect()
@@ -493,7 +552,11 @@ class SecureClientApp:
             ci = inner_plain[32:48]
             hk = inner_plain[48:80]
             lc = struct.unpack_from("!H", inner_plain, 80)[0]
-            chname = inner_plain[82 : 82 + lc].decode("utf-8")
+            if len(inner_plain) < 82 + lc:
+                self._ui_error("Login", "Malformed channel name in key material.")
+                self.disconnect()
+                return
+            chname = inner_plain[82 : 82 + lc].decode("utf-8", errors="replace")
             self.channel_aes, self.channel_iv, self.channel_hmac = ca, ci, hk
             self.subscribed_channel = chname
             self.log_line(f"Channel assigned by server: {chname}")
@@ -510,6 +573,7 @@ class SecureClientApp:
             self._ui_error("Login", str(e))
             self.disconnect()
 
+    # Receive loop: handle broadcast frames until disconnect.
     def _recv_loop(self) -> None:
         assert self.sock is not None
         try:
@@ -528,12 +592,16 @@ class SecureClientApp:
         finally:
             self.root.after(0, self._on_server_drop)
 
+    # UI callback when the server connection is dropped.
     def _on_server_drop(self) -> None:
         if self.sock:
             self.log_line("Server connection closed or error.")
         self.disconnect()
 
+    # Verify HMAC, decrypt, and append a received broadcast message.
     def _handle_broadcast(self, body: bytes) -> None:
+        # Broadcast payload (op "B") is the same blob structure produced by send ("M"):
+        #   u32_be(len_ct) + ct + 64B HMAC-SHA3-512(channel_hmac_key, ct)
         if len(body) < 4 + SHA3_512_DIGEST:
             self.log_line("Broadcast packet too short")
             return
@@ -559,6 +627,7 @@ class SecureClientApp:
             return
         self.log_line(f"RECEIVED (plaintext): {msg}")
 
+        # UI callback to append plaintext into the incoming box.
         def _append() -> None:
             self.incoming_text.configure(state="normal")
             self.incoming_text.insert("end", msg + "\n")
@@ -567,6 +636,7 @@ class SecureClientApp:
 
         self.root.after(0, _append)
 
+    # Start sending a broadcast message in a background thread.
     def send_broadcast(self) -> None:
         if not self.sock or not self.authenticated:
             return
@@ -575,12 +645,14 @@ class SecureClientApp:
             return
         threading.Thread(target=self._send_broadcast_worker, args=(text,), daemon=True).start()
 
+    # Encrypt+MAC and send a broadcast message to the server.
     def _send_broadcast_worker(self, text: str) -> None:
         try:
             assert self.channel_aes and self.channel_iv and self.channel_hmac and self.sock
             pt = text.encode("utf-8")
             ct = aes_cbc_pkcs7_encrypt(self.channel_aes, self.channel_iv, pt)
             mac = hmac_sha3_512(self.channel_hmac, ct)
+            # Message payload (op "M"): u32_be(len_ct) + ct + 64B HMAC.
             blob = struct.pack("!I", len(ct)) + ct + mac
             self.log_line(f"SENT ciphertext_len={len(ct)}, HMAC (hex prefix)={mac.hex()[:32]}...")
             send_frame(self.sock, b"M" + blob)
@@ -588,12 +660,14 @@ class SecureClientApp:
             self.log_line(f"Send error: {e}")
             self._ui_error("Send", str(e))
 
+    # Window close handler.
     def on_close(self) -> None:
         self.disconnect()
         self.root.destroy()
 
 
 def main() -> None:
+    # GUI entrypoint.
     root = tk.Tk()
     app = SecureClientApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
